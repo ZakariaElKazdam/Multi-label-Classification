@@ -1,53 +1,166 @@
-#from __future__ import annotations
-
 import argparse
 import json
 import os
+from datetime import datetime
 from typing import Any, Dict
 
-from .data import DEFAULT_FOCUS_TAGS, load_dataset_as_dataframe, filter_to_focus_tags, load_json_file
-from .model import TrainedModel, evaluate_model, train_model
+import pandas as pd
+
+from .data import load_dataset_as_dataframe, load_json_file
+from .preprocessing import (
+    DEFAULT_FOCUS_TAGS,
+    filter_to_focus_tags,
+    remove_empty_tags,
+    preprocess_description,
+    preprocess_code,
+)
+
+from .model import TrainedModel, train_model
 
 
 def cmd_train(args: argparse.Namespace) -> None:
-    df = load_dataset_as_dataframe(args.data_dir)
+    # Parse features
+    features = args.features.split(",") if args.features else ["description"]
+    features = [f.strip() for f in features]
+    
+    # Validate features
+    valid_features = {"description", "code"}
+    for feat in features:
+        if feat not in valid_features:
+            raise ValueError(f"Invalid feature: {feat}. Must be one of {valid_features}")
+    
+    # Load data with requested features
+    df = load_dataset_as_dataframe(args.data_dir, features=features)
+    
+    # Apply preprocessing
+    if "description" in features:
+        df["text_description"] = df["text_description"].apply(preprocess_description)
+    if "code" in features:
+        df["text_code"] = df["text_code"].apply(preprocess_code)
+    
+    # Filter to focus tags if requested
     if args.focus_tags_only:
         df = filter_to_focus_tags(df, DEFAULT_FOCUS_TAGS)
+        # Remove examples without tags (after filtering)
+        df = remove_empty_tags(df)
 
-    random_state = args.random_state if hasattr(args, "random_state") else 42
-    test_size = args.test_size if hasattr(args, "test_size") else 0.2
+    #all the arguments below have a default value
+    random_state = args.random_state 
+    train_size = args.train_size
+    val_size = args.val_size
 
-    model, report = train_model(df["text"].tolist(), df["tags"].tolist(), test_size=test_size, random_state=random_state)
+    model, val_report, test_ids = train_model(
+        df=df,
+        features=features,
+        train_size=train_size,
+        val_size=val_size,
+        random_state=random_state,
+    )
+    
+    # Save model
     os.makedirs(os.path.dirname(args.model_path) or ".", exist_ok=True)
     model.save(args.model_path)
 
-    print(json.dumps(report, indent=2))
+    # Create report dictionary
+    test_size = 1.0 - train_size - val_size
+    report_data = {
+        "features": features,
+        "embedding": "TF-IDF",
+        "embedding_params": {
+            "ngram_range": [1, 2],
+            "min_df": 2,
+            "max_df": 0.9,
+            "sublinear_tf": True,
+        },
+        "classifier": "LogisticRegression",
+        "classifier_params": {
+            "solver": "liblinear",
+            "class_weight": "balanced",
+            "max_iter": 250,
+            "strategy": "OneVsRest",
+        },
+        "train_size": train_size,
+        "val_size": val_size,
+        "test_size": test_size,
+        "random_state": random_state,
+        "focus_tags_only": args.focus_tags_only,
+        "validation_metrics": val_report,
+        "test_set_ids": test_ids,
+        "timestamp": datetime.now().isoformat(),
+    }
+    
+    # Save report to reports/ directory
+    os.makedirs("reports", exist_ok=True)
+    timestamp_str = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
+    report_filename = f"reports/report_{timestamp_str}.json"
+    
+    with open(report_filename, "w", encoding="utf-8") as f:
+        json.dump(report_data, f, indent=2)
+    
+    print(f"Model saved to: {args.model_path}")
+    print(f"Report saved to: {report_filename}")
+    print(f"Test set contains {len(test_ids)} examples")
+    print("\n=== Validation Metrics ===")
+    print(json.dumps(val_report, indent=2))
 
 
-def cmd_evaluate(args: argparse.Namespace) -> None:
-    df = load_dataset_as_dataframe(args.data_dir)
-    if args.focus_tags_only:
-        df = filter_to_focus_tags(df, DEFAULT_FOCUS_TAGS)
-
-    model = TrainedModel.load(args.model_path)
-    report = evaluate_model(model, df["text"].tolist(), df["tags"].tolist())
-    print(json.dumps(report, indent=2))
 
 
 def cmd_predict(args: argparse.Namespace) -> None:
     model = TrainedModel.load(args.model_path)
-    record = load_json_file(args.json_file)
-
-    # Use only the problem description
-    desc = record.get("prob_desc_description") or ""
-    text = desc
-
-    tags = model.predict([text], threshold=args.threshold)[0]
-
-    out: Dict[str, Any] = {
-        "predicted_tags": tags,
-    }
-    print(json.dumps(out, indent=2))
+    
+    if args.json_file and args.data_dir:
+        raise ValueError("Cannot specify both --json-file and --data-dir. Choose one.")
+    if not args.json_file and not args.data_dir:
+        raise ValueError("Must specify either --json-file or --data-dir.")
+    
+    if args.json_file:
+        # Single file mode
+        record = load_json_file(args.json_file)
+        desc = record.get("prob_desc_description") or ""
+        code = record.get("source_code") or ""
+        
+        # Preprocess
+        desc_processed = preprocess_description(desc)
+        code_processed = preprocess_code(code)
+        
+        # Build DataFrame for prediction
+        data = {}
+        if "description" in model.features:
+            data["text_description"] = [desc_processed]
+        if "code" in model.features:
+            data["text_code"] = [code_processed]
+        X = pd.DataFrame(data)
+        
+        tags = model.predict(X, threshold=args.threshold)[0]
+        
+        out = { "predicted_tags": tags }
+        print(json.dumps(out, indent=2))
+    
+    else:  # args.data_dir
+        # Dataset mode - predict on all files in directory
+        df = load_dataset_as_dataframe(args.data_dir, features=model.features)
+        
+        # Apply preprocessing only to loaded features
+        if "description" in model.features:
+            df["text_description"] = df["text_description"].apply(preprocess_description)
+        if "code" in model.features:
+            df["text_code"] = df["text_code"].apply(preprocess_code)
+        
+        # Predict directly on DataFrame
+        all_tags = model.predict(df, threshold=args.threshold)
+        
+        predictions = []
+        for i, tags in enumerate(all_tags):
+            predictions.append({
+                "problem_id": df.iloc[i]["problem_id"],
+                "predicted_tags": tags,
+            })
+        
+        out: Dict[str, Any] = {
+            "predictions": predictions,
+        }
+        print(json.dumps(out, indent=2))
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -56,50 +169,48 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     # Train
     p_train = subparsers.add_parser("train", help="Train a new model")
-    p_train.add_argument("--data-dir", required=True, help="Directory with sample_*.json files")
+    p_train.add_argument("--data-dir", required=True, help="Directory with json files")
     p_train.add_argument(
         "--model-path",
         required=True,
         help="Path to save the trained model (e.g. models/model.joblib)",
     )
     p_train.add_argument(
-        "--focus-tags-only",
+        "--focus-tags-only",   # this one is not required as it a boolean flag
         action="store_true",
         help="Keep only the 8 focus tags in targets",
     )
     p_train.add_argument(
         "--random-state",
         type=int,
-        default=42,
+        default=42,  
         help="Random seed for reproducibility (default: 42)",
     )
     p_train.add_argument(
-        "--test-size",
+        "--train-size",
         type=float,
-        default=0.2,
-        help="Fraction of data to use for validation (default: 0.2)",
+        default=0.7,
+        help="Fraction of data to use for training (default: 0.7)",
+    )
+    p_train.add_argument(
+        "--val-size",
+        type=float,
+        default=0.15,
+        help="Fraction of data to use for validation (default: 0.15)",
+    )
+    p_train.add_argument(
+        "--features",
+        type=str,
+        default="description",
+        help="Comma-separated list of features to use: 'description', 'code', or 'description,code' (default: 'description')",
     )
     p_train.set_defaults(func=cmd_train)
 
-    # Evaluate
-    p_eval = subparsers.add_parser("evaluate", help="Evaluate an existing model")
-    p_eval.add_argument("--data-dir", required=True, help="Directory with sample_*.json files")
-    p_eval.add_argument(
-        "--model-path",
-        required=True,
-        help="Path to a trained model file",
-    )
-    p_eval.add_argument(
-        "--focus-tags-only",
-        action="store_true",
-        help="Keep only the 8 focus tags in targets",
-    )
-    p_eval.set_defaults(func=cmd_evaluate)
-
     # Predict
-    p_pred = subparsers.add_parser("predict", help="Predict tags for a single JSON example")
+    p_pred = subparsers.add_parser("predict", help="Predict tags for a JSON file or dataset")
     p_pred.add_argument("--model-path", required=True, help="Path to a trained model file")
-    p_pred.add_argument("--json-file", required=True, help="Path to a sample_*.json file")
+    p_pred.add_argument("--json-file", help="Path to a single sample_*.json file")
+    p_pred.add_argument("--data-dir", help="Path to directory with json files (external dataset)")
     p_pred.add_argument(
         "--threshold",
         type=float,

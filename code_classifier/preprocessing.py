@@ -1,5 +1,5 @@
 import re
-from typing import List, Sequence
+from typing import Sequence
 
 import pandas as pd
 
@@ -13,33 +13,31 @@ DEFAULT_FOCUS_TAGS: Sequence[str] = (
     "geometry",
     "games",
     "probabilities",
-)  # the eight tags we'll focus on
+)  # the eight tags we'll focus on according to the pdf
 
 
 def preprocess_description(text: str) -> str:
     """
     Preprocess problem description text.
     
-    - Removes LaTeX delimiters ($$$) to avoid polluting TF-IDF vocabulary
+    - Removes Latex delimiters ($$$) 
     - Normalizes whitespace (multiple spaces -> single space)
     - Strips leading/trailing whitespace
     
     Args:
-        text: Raw text from problem description
+        text: the text from problem description
     
     Returns:
-        Preprocessed text
+        Clean preprocessed text
     """
     if not text:
         return ""
     
-    # Remove $$$ delimiters (replace with space to avoid concatenating words)
     text = text.replace("$$$", " ")
     
-    # Normalize whitespace: replace multiple spaces/tabs/newlines with single space
+    # replace multiple spaces/tabs/newlines with single space
     text = re.sub(r'\s+', ' ', text)
     
-    # Remove leading and trailing whitespace
     text = text.strip()
     
     return text
