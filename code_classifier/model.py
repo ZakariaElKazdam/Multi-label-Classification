@@ -150,19 +150,9 @@ class Word2VecVectorizer:
 def build_pipeline(features: List[str] = None, embedding_type: str = "tfidf", word2vec_vector_size: int = 100, word2vec_min_count: int = 2, word2vec_epochs: int = 10):
     """
     Create embedding vectorizers and classifier.
-    
-    Args:
-        features: List of features to use. Options: ["description"], ["code"], or ["description", "code"]
-                  Default: ["description"]
-        embedding_type: Type of embedding ("tfidf" or "word2vec")
-        word2vec_vector_size: Dimension of Word2Vec embeddings (default: 100)
-        word2vec_min_count: Minimum word count for Word2Vec (default: 2)
-        word2vec_epochs: Number of training epochs for Word2Vec (default: 10)
-    
-    Returns:
-        Tuple of (vectorizers_dict, classifier)
     """
     
+    # Logistic regression with class balancing for imbalanced data
     base_clf = LogisticRegression(
         solver="liblinear",
         class_weight="balanced",
@@ -174,10 +164,10 @@ def build_pipeline(features: List[str] = None, embedding_type: str = "tfidf", wo
     vectorizers = {}
     
     if embedding_type == "tfidf":
-        # TF-IDF parameters
+        # TF-IDF with unigrams and bigrams
         tfidf_params = {
             "ngram_range": (1, 2),
-            "min_df": 2,
+            "min_df": 2,  # ignore words that appear less than 2 times
             "max_df": 0.9,
             "sublinear_tf": True,
         }
@@ -188,7 +178,7 @@ def build_pipeline(features: List[str] = None, embedding_type: str = "tfidf", wo
             vectorizers["code"] = TfidfVectorizer(**tfidf_params)
     
     elif embedding_type == "word2vec":
-        # Create separate Word2Vec vectorizers for each feature
+        # Word2Vec trained on the dataset
         if "description" in features:
             vectorizers["description"] = Word2VecVectorizer(vector_size=word2vec_vector_size, min_count=word2vec_min_count, epochs=word2vec_epochs)
         if "code" in features:
@@ -212,20 +202,10 @@ def train_model(
     random_state: int = 42,
 ) -> Tuple[TrainedModel, dict, List[str]]:
     """
-    Train the model with train/val/test split and return validation metrics and test set IDs.
-    
-    Args:
-        df: DataFrame with columns: text_description, text_code, tags, problem_id
-        features: List of features to use (e.g., ["description"], ["code"], or ["description", "code"])
-        train_size: Fraction of data for training (default: 0.7)
-        val_size: Fraction of data for validation (default: 0.15)
-        random_state: Random seed for reproducibility
-    
-    Returns:
-        Tuple of (model, validation_report, test_ids)
-        test_ids contains the problem IDs of the test set (preserved for later evaluation)
+    Train the model with train/val/test split.
+    Returns validation metrics and test set IDs.
     """
-    # Validate split sizes
+    # Check that split sizes make sense
     test_size = 1.0 - train_size - val_size
     if test_size <= 0:
         raise ValueError(f"train_size + val_size must be < 1.0, got {train_size} + {val_size} = {train_size + val_size}")
