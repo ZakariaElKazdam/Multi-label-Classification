@@ -49,9 +49,18 @@ def cmd_train(args: argparse.Namespace) -> None:
     train_size = args.train_size
     val_size = args.val_size
 
+    embedding_type = getattr(args, "embedding", "tfidf")
+    word2vec_vector_size = getattr(args, "word2vec_vector_size", 100)
+    word2vec_min_count = getattr(args, "word2vec_min_count", 2)
+    word2vec_epochs = getattr(args, "word2vec_epochs", 10)
+    
     model, val_report, test_ids = train_model(
         df=df,
         features=features,
+        embedding_type=embedding_type,
+        word2vec_vector_size=word2vec_vector_size,
+        word2vec_min_count=word2vec_min_count,
+        word2vec_epochs=word2vec_epochs,
         train_size=train_size,
         val_size=val_size,
         random_state=random_state,
@@ -63,15 +72,25 @@ def cmd_train(args: argparse.Namespace) -> None:
 
     # Create report dictionary
     test_size = 1.0 - train_size - val_size
-    report_data = {
-        "features": features,
-        "embedding": "TF-IDF",
-        "embedding_params": {
+    if embedding_type == "tfidf":
+        embedding_params = {
             "ngram_range": [1, 2],
             "min_df": 2,
             "max_df": 0.9,
             "sublinear_tf": True,
-        },
+        }
+    else:
+        embedding_params = {
+            "vector_size": word2vec_vector_size,
+            "window": 5,
+            "min_count": word2vec_min_count,
+            "epochs": word2vec_epochs,
+        }
+    
+    report_data = {
+        "features": features,
+        "embedding": embedding_type,
+        "embedding_params": embedding_params,
         "classifier": "LogisticRegression",
         "classifier_params": {
             "solver": "liblinear",
@@ -203,6 +222,31 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default="description",
         help="Comma-separated list of features to use: 'description', 'code', or 'description,code' (default: 'description')",
+    )
+    p_train.add_argument(
+        "--embedding",
+        type=str,
+        default="tfidf",
+        choices=["tfidf", "word2vec"],
+        help="Embedding method to use (default: 'tfidf')",
+    )
+    p_train.add_argument(
+        "--word2vec-vector-size",
+        type=int,
+        default=100,
+        help="Dimension of Word2Vec embeddings (default: 100)",
+    )
+    p_train.add_argument(
+        "--word2vec-min-count",
+        type=int,
+        default=2,
+        help="Minimum word count for Word2Vec (default: 2)",
+    )
+    p_train.add_argument(
+        "--word2vec-epochs",
+        type=int,
+        default=10,
+        help="Number of training epochs for Word2Vec (default: 10)",
     )
     p_train.set_defaults(func=cmd_train)
 

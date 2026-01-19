@@ -11,20 +11,21 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import classification_report
 from sklearn.model_selection import train_test_split
 from sklearn.multiclass import OneVsRestClassifier
-from scipy.sparse import hstack
+from scipy.sparse import hstack, csr_matrix
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import MultiLabelBinarizer
 
-
+from gensim.models import Word2Vec as W2V
 
 
 @dataclass
 class TrainedModel:
-    vectorizers: dict  # TF-IDF vectorizers for each feature
+    vectorizers: dict  # Embedding vectorizers for each feature
     clf: OneVsRestClassifier  # classifier
     features: List[str]  # list of features used
+    embedding_type: str  # type of embedding: "tfidf" or "word2vec"
     mlb: MultiLabelBinarizer  # convertit les tags en format binaire 
-    classes_: List[str]  # liste des tags possibles
+    classes_: List[str]  # liste des tags 
 
     def save(self, path: str) -> None:
         joblib.dump(
@@ -32,6 +33,7 @@ class TrainedModel:
                 "vectorizers": self.vectorizers,
                 "clf": self.clf,
                 "features": self.features,
+                "embedding_type": self.embedding_type,
                 "mlb": self.mlb,
                 "classes": self.classes_,
             },
@@ -40,14 +42,14 @@ class TrainedModel:
 
     @classmethod
     def load(cls, path: str) -> "TrainedModel":
-
         obj = joblib.load(path)
         return cls(
             vectorizers=obj["vectorizers"],
             clf=obj["clf"],
-            features=obj.get("features", ["description"]), # the default features used to train the model
+            features=obj.get("features", ["description"]),
+            embedding_type=obj.get("embedding_type", "tfidf"),
             mlb=obj["mlb"],
-            classes_=list(obj["classes"]),
+            classes_=obj["classes"],
         )
 
     def predict(self, X: pd.DataFrame, threshold: float = 0.5) -> List[List[str]]:
@@ -57,27 +59,105 @@ class TrainedModel:
             X: DataFrame with columns text_description and/or text_code
             threshold: Probability threshold for predictions
         """
+        # Vectorize each feature
         X_list = []
         if "description" in self.features:
-            X_desc = self.vectorizers["description"].transform(X["text_description"].tolist())
+            X_desc = self.vectorizers["description"].transform(
+                X["text_description"].tolist()
+            )
             X_list.append(X_desc)
         if "code" in self.features:
-            X_code = self.vectorizers["code"].transform(X["text_code"].tolist())
+            X_code = self.vectorizers["code"].transform(
+                X["text_code"].tolist()
+            )
             X_list.append(X_code)
-        X_combined = hstack(X_list) if len(X_list) > 1 else X_list[0]
+
+        # Combine embeddings
+        if len(X_list) == 1:
+            # Single feature: nothing to concatenate
+            X_combined = X_list[0]
+        else:
+            # All embeddings ont été produits avec le même type d'embeddding
+            first = X_list[0]
+            if isinstance(first, np.ndarray):
+                # Word2Vec: toutes les matrices sont denses
+                X_combined = np.hstack(X_list)
+            else:
+                # TF-IDF: toutes les matrices sont sparse
+                X_combined = hstack(X_list)
         
         probas = self.clf.predict_proba(X_combined)
         labels_bin = (probas >= threshold).astype(int)
         return self.mlb.inverse_transform(labels_bin)
 
 
-def build_pipeline(features: List[str] = None):
+class Word2VecVectorizer:
+    """Simple Word2Vec vectorizer - trains on data."""
+    
+    def __init__(self, vector_size: int = 100, window: int = 5, min_count: int = 2, epochs: int = 10):
+        try:
+            self.Word2Vec = W2V
+        except ImportError:
+            raise ImportError("gensim package is required. Install with: pip install gensim")
+        
+        self.vector_size = vector_size
+        self.window = window
+        self.min_count = min_count
+        self.epochs = epochs
+        self.model = None
+    
+    def fit_transform(self, texts: List[str]) -> np.ndarray:
+        """Train Word2Vec on texts and transform them."""
+        # Tokenize texts (simple split, can be improved !!!!!)
+        sentences = [text.split() for text in texts]
+        
+        # Train Word2Vec model sur sentences
+        self.model = self.Word2Vec(
+            sentences,
+            vector_size=self.vector_size,
+            window=self.window,
+            min_count=self.min_count,
+            workers=1,
+            sg=1,  # skip-gram
+            epochs=self.epochs,
+        )
+        
+        return self.transform(texts)
+    
+    def transform(self, texts: List[str]) -> np.ndarray:
+        """Transform texts to Word2Vec vectors (average of word vectors)."""
+        if self.model is None:
+            raise ValueError("Word2Vec model must be fitted first")
+        
+        vectors = []
+        for text in texts:
+            words = text.split()
+            if words:
+                word_vecs = []
+                for word in words:
+                    if word in self.model.wv: 
+                        #check if the word exist in the vocabulary already, we skip it if it doesn't ( too rare to be useful )
+                        word_vecs.append(self.model.wv[word])
+                if word_vecs:
+                    vectors.append(np.mean(word_vecs, axis=0))
+                else:
+                    vectors.append(np.zeros(self.vector_size))
+            else:
+                vectors.append(np.zeros(self.vector_size))
+        return np.array(vectors)
+
+
+def build_pipeline(features: List[str] = None, embedding_type: str = "tfidf", word2vec_vector_size: int = 100, word2vec_min_count: int = 2, word2vec_epochs: int = 10):
     """
-    Create TF-IDF vectorizers and classifier.
+    Create embedding vectorizers and classifier.
     
     Args:
         features: List of features to use. Options: ["description"], ["code"], or ["description", "code"]
                   Default: ["description"]
+        embedding_type: Type of embedding ("tfidf" or "word2vec")
+        word2vec_vector_size: Dimension of Word2Vec embeddings (default: 100)
+        word2vec_min_count: Minimum word count for Word2Vec (default: 2)
+        word2vec_epochs: Number of training epochs for Word2Vec (default: 10)
     
     Returns:
         Tuple of (vectorizers_dict, classifier)
@@ -91,20 +171,31 @@ def build_pipeline(features: List[str] = None):
     )
     clf = OneVsRestClassifier(base_clf)
     
-    # TF-IDF parameters
-    tfidf_params = {
-        "ngram_range": (1, 2),
-        "min_df": 2,
-        "max_df": 0.9,
-        "sublinear_tf": True,
-    }
-    
-    # Create vectorizers for each feature
     vectorizers = {}
-    if "description" in features:
-        vectorizers["description"] = TfidfVectorizer(**tfidf_params)
-    if "code" in features:
-        vectorizers["code"] = TfidfVectorizer(**tfidf_params)
+    
+    if embedding_type == "tfidf":
+        # TF-IDF parameters
+        tfidf_params = {
+            "ngram_range": (1, 2),
+            "min_df": 2,
+            "max_df": 0.9,
+            "sublinear_tf": True,
+        }
+        
+        if "description" in features:
+            vectorizers["description"] = TfidfVectorizer(**tfidf_params)
+        if "code" in features:
+            vectorizers["code"] = TfidfVectorizer(**tfidf_params)
+    
+    elif embedding_type == "word2vec":
+        # Create separate Word2Vec vectorizers for each feature
+        if "description" in features:
+            vectorizers["description"] = Word2VecVectorizer(vector_size=word2vec_vector_size, min_count=word2vec_min_count, epochs=word2vec_epochs)
+        if "code" in features:
+            vectorizers["code"] = Word2VecVectorizer(vector_size=word2vec_vector_size, min_count=word2vec_min_count, epochs=word2vec_epochs)
+    
+    else:
+        raise ValueError(f"Unknown embedding_type: {embedding_type}. Supported: 'tfidf', 'word2vec'")
     
     return vectorizers, clf
 
@@ -112,6 +203,10 @@ def build_pipeline(features: List[str] = None):
 def train_model(
     df: pd.DataFrame,
     features: List[str],
+    embedding_type: str = "tfidf",
+    word2vec_vector_size: int = 100,
+    word2vec_min_count: int = 2,
+    word2vec_epochs: int = 10,
     train_size: float = 0.7,
     val_size: float = 0.15,
     random_state: int = 42,
@@ -174,7 +269,7 @@ def train_model(
         ids_test.append(ids_list[idx])
 
     # building the pipeline
-    vectorizers, clf = build_pipeline(features=features)
+    vectorizers, clf = build_pipeline(features=features, embedding_type=embedding_type, word2vec_vector_size=word2vec_vector_size, word2vec_min_count=word2vec_min_count, word2vec_epochs=word2vec_epochs)
     
     # Vectorize each feature separately
     X_train_list = []
@@ -192,9 +287,21 @@ def train_model(
         X_train_list.append(X_train_code)
         X_val_list.append(X_val_code)
     
-    # Concatenate features
-    X_train = hstack(X_train_list) # works also if there is only one feature
-    X_val = hstack(X_val_list)
+    # Concatenate features (handle both sparse and dense)
+    if len(X_train_list) == 1:
+        X_train = X_train_list[0]
+        X_val = X_val_list[0]
+    else:
+        # Toutes les features utilisent le même type d'embedding
+        first = X_train_list[0]
+        if isinstance(first, np.ndarray):
+            # Word2Vec : tout est dense
+            X_train = np.hstack(X_train_list)
+            X_val = np.hstack(X_val_list)
+        else:
+            # TF-IDF : tout est sparse
+            X_train = hstack(X_train_list)
+            X_val = hstack(X_val_list)
     
     # Train classifier
     clf.fit(X_train, y_train)
@@ -213,6 +320,7 @@ def train_model(
         vectorizers=vectorizers,
         clf=clf,
         features=features,
+        embedding_type=embedding_type,
         mlb=mlb,
         classes_=list(mlb.classes_)
     )
