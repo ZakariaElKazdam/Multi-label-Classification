@@ -52,32 +52,40 @@ def cmd_train(args: argparse.Namespace) -> None:
         df = remove_empty_tags(df)
         print(f"After filtering to focus tags: {len(df)} examples")
 
-    random_state = args.random_state 
-    train_size = args.train_size
-    val_size = args.val_size
-
-    # Get embedding type
-    embedding_type = getattr(args, "embedding", "tfidf")
-    word2vec_vector_size = getattr(args, "word2vec_vector_size", 100)
-    word2vec_min_count = getattr(args, "word2vec_min_count", 2)
-    word2vec_epochs = getattr(args, "word2vec_epochs", 10)
+    # Get embedding types for description and code separately
+    embedding_desc = getattr(args, "embedding_desc", "tfidf")
+    embedding_code = getattr(args, "embedding_code", "tfidf")
+    word2vec_params = {
+        "vector_size": getattr(args, "word2vec_vector_size", 100),
+        "min_count": getattr(args, "word2vec_min_count", 2),
+        "epochs": getattr(args, "word2vec_epochs", 10),
+    }
+    split_params = {
+        "train_size": args.train_size,
+        "val_size": args.val_size,
+        "random_state": args.random_state,
+    }
     
-    # Note: TF-IDF generally performs better on this dataset than Word2Vec
-    if embedding_type == "word2vec":
-        print(f"Using Word2Vec (vector_size={word2vec_vector_size})")
+    # Warning if CodeBERT is used for description (it's optimized for code)
+    if "description" in features and embedding_desc == "codebert":
+        print("  WARNING: CodeBERT is optimized for code, not natural language descriptions.")
+        print("   Consider using TF-IDF or Word2Vec for description instead.")
+    
+    # Print what we're using
+    if "description" in features:
+        print(f"Description embedding: {embedding_desc}")
+    if "code" in features:
+        print(f"Code embedding: {embedding_code}")
     
     # Train the model with train/val/test split
     # We keep test set separate for final evaluation after comparing models
     model, val_report, test_ids = train_model(
         df=df,
         features=features,
-        embedding_type=embedding_type,
-        word2vec_vector_size=word2vec_vector_size,
-        word2vec_min_count=word2vec_min_count,
-        word2vec_epochs=word2vec_epochs,
-        train_size=train_size,
-        val_size=val_size,
-        random_state=random_state,
+        embedding_desc=embedding_desc,
+        embedding_code=embedding_code,
+        word2vec_params=word2vec_params,
+        split_params=split_params,
     )
     
     # Save the trained model
@@ -87,27 +95,47 @@ def cmd_train(args: argparse.Namespace) -> None:
     model.save(args.model_path)
 
     # Build the report with all the config and results
-    test_size = 1.0 - train_size - val_size
+    test_size = 1.0 - split_params["train_size"] - split_params["val_size"]
     
-    # Embedding parameters depend on the method used
-    if embedding_type == "tfidf":
-        embedding_params = {
-            "ngram_range": [1, 2],  # unigrams and bigrams
-            "min_df": 2,
-            "max_df": 0.9,
-            "sublinear_tf": True,
-        }
-    else:
-        embedding_params = {
-            "vector_size": word2vec_vector_size,
-            "window": 5,
-            "min_count": word2vec_min_count,
-            "epochs": word2vec_epochs,
-        }
+    # Embedding parameters - can be different for description and code
+    embedding_params = {}
+    if "description" in features:
+        if embedding_desc == "tfidf":
+            embedding_params["description"] = {
+                "ngram_range": [1, 2],
+                "min_df": 2,
+                "max_df": 0.9,
+                "sublinear_tf": True,
+            }
+        elif embedding_desc == "word2vec":
+            embedding_params["description"] = word2vec_params.copy()
+            embedding_params["description"]["window"] = 5
+        else:  # codebert
+            embedding_params["description"] = {
+                "model": "microsoft/codebert-base",
+                "max_length": 512,
+            }
+    
+    if "code" in features:
+        if embedding_code == "tfidf":
+            embedding_params["code"] = {
+                "ngram_range": [1, 2],
+                "min_df": 2,
+                "max_df": 0.9,
+                "sublinear_tf": True,
+            }
+        elif embedding_code == "word2vec":
+            embedding_params["code"] = word2vec_params.copy()
+            embedding_params["code"]["window"] = 5
+        else:  # codebert
+            embedding_params["code"] = {
+                "model": "microsoft/codebert-base",
+                "max_length": 512,
+            }
     
     report_data = {
         "features": features,
-        "embedding": embedding_type,
+        "embedding_types": model.embedding_type,
         "embedding_params": embedding_params,
         "classifier": "LogisticRegression",
         "classifier_params": {
@@ -116,10 +144,10 @@ def cmd_train(args: argparse.Namespace) -> None:
             "max_iter": 250,
             "strategy": "OneVsRest",
         },
-        "train_size": train_size,
-        "val_size": val_size,
+        "train_size": split_params["train_size"],
+        "val_size": split_params["val_size"],
         "test_size": test_size,
-        "random_state": random_state,
+        "random_state": split_params["random_state"],
         "focus_tags_only": args.focus_tags_only,
         "validation_metrics": val_report,
         "test_set_ids": test_ids,  # save test IDs to avoid using them during development
@@ -128,8 +156,15 @@ def cmd_train(args: argparse.Namespace) -> None:
     
     # Save report in reports/ folder
     os.makedirs("reports", exist_ok=True)
-    timestamp_str = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
-    report_filename = f"reports/report_{timestamp_str}.json"
+    
+    # Generate model name from features and embedding types
+    features_str = "_".join(sorted(features))  # sorted for consistency
+    embedding_str = "_".join([f"{k}_{v}" for k, v in sorted(model.embedding_type.items())])
+    model_name = f"{embedding_str}_{features_str}_{report_data["classifier"]}"
+    
+    # Format: month_day_hour_minute
+    timestamp_str = datetime.now().strftime("%m_%d_%H_%M")
+    report_filename = f"reports/report_{model_name}_{timestamp_str}.json"
     
     with open(report_filename, "w", encoding="utf-8") as f:
         json.dump(report_data, f, indent=2)
@@ -226,11 +261,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Features to use: 'description', 'code', or 'description,code'",
     )
     p_train.add_argument(
-        "--embedding",
+        "--embedding-desc",
         type=str,
         default="tfidf",
-        choices=["tfidf", "word2vec"],
-        help="Embedding method (tfidf works better on this dataset)",
+        choices=["tfidf", "word2vec", "codebert"],
+        help="Embedding method for description (default: tfidf). Warning: CodeBERT is optimized for code, not descriptions.",
+    )
+    p_train.add_argument(
+        "--embedding-code",
+        type=str,
+        default="tfidf",
+        choices=["tfidf", "word2vec", "codebert"],
+        help="Embedding method for code (default: tfidf). CodeBERT gives best results for code.",
     )
     p_train.add_argument("--word2vec-vector-size", type=int, default=100, help="Word2Vec dimension")
     p_train.add_argument("--word2vec-min-count", type=int, default=2, help="Word2Vec min word count")

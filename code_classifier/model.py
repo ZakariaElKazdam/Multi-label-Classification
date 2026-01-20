@@ -8,11 +8,10 @@ import numpy as np
 import pandas as pd
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import classification_report
+from sklearn.metrics import classification_report, jaccard_score, hamming_loss
 from sklearn.model_selection import train_test_split
 from sklearn.multiclass import OneVsRestClassifier
-from scipy.sparse import hstack, csr_matrix
-from sklearn.pipeline import Pipeline
+from scipy.sparse import hstack
 from sklearn.preprocessing import MultiLabelBinarizer
 
 from gensim.models import Word2Vec as W2V
@@ -23,7 +22,7 @@ class TrainedModel:
     vectorizers: dict  # Embedding vectorizers for each feature
     clf: OneVsRestClassifier  # classifier
     features: List[str]  # list of features used
-    embedding_type: str  # type of embedding: "tfidf" or "word2vec"
+    embedding_type: dict  # type of embedding per feature: {"description": "tfidf", "code": "codebert"}
     mlb: MultiLabelBinarizer  # convertit les tags en format binaire 
     classes_: List[str]  # liste des tags 
 
@@ -47,10 +46,19 @@ class TrainedModel:
             vectorizers=obj["vectorizers"],
             clf=obj["clf"],
             features=obj.get("features", ["description"]),
-            embedding_type=obj.get("embedding_type", "tfidf"),
+            embedding_type=obj.get("embedding_type", {'description': 'tfidf', 'code': 'tfidf'}),
             mlb=obj["mlb"],
             classes_=obj["classes"],
         )
+
+    def embed_feature(self, feature: str, texts: List[str]) -> np.ndarray:
+        """Embed a list of texts for a feature using the appropriate vectorizer."""
+        embedding_type = self.embedding_type.get(feature, "tfidf")
+        if embedding_type == "codebert":
+            return get_codebert_embeddings(texts)
+        else:
+            # vectorizer (TF-IDF or Word2Vec) depending on user's previous choice : flexibility hehe :)
+            return self.vectorizers[feature].transform(texts)
 
     def predict(self, X: pd.DataFrame, threshold: float = 0.5) -> List[List[str]]:
         """Predict labels for a batch of examples.
@@ -62,29 +70,28 @@ class TrainedModel:
         # Vectorize each feature
         X_list = []
         if "description" in self.features:
-            X_desc = self.vectorizers["description"].transform(
-                X["text_description"].tolist()
-            )
+            X_desc = self.embed_feature("description", X["text_description"].tolist())
             X_list.append(X_desc)
+        
         if "code" in self.features:
-            X_code = self.vectorizers["code"].transform(
-                X["text_code"].tolist()
-            )
+            X_code = self.embed_feature("code", X["text_code"].tolist())
             X_list.append(X_code)
 
-        # Combine embeddings
+        # Combine embeddings: TF-IDF gives sparse matrices, Word2Vec/CodeBERT give dense
         if len(X_list) == 1:
-            # Single feature: nothing to concatenate
             X_combined = X_list[0]
         else:
-            # All embeddings ont été produits avec le même type d'embeddding
-            first = X_list[0]
-            if isinstance(first, np.ndarray):
-                # Word2Vec: toutes les matrices sont denses
-                X_combined = np.hstack(X_list)
+            # Check types to use the most efficient concatenation
+            all_sparse = all(hasattr(x, "toarray") for x in X_list)
+            all_dense = all(not hasattr(x, "toarray") for x in X_list)
+            
+            if all_sparse:
+                X_combined = hstack(X_list)  # hstack is a method of scipy.sparse to concatenate sparse matrices
+            elif all_dense:
+                X_combined = np.hstack(X_list)  # Direct concatenation, no conversion needed
             else:
-                # TF-IDF: toutes les matrices sont sparse
-                X_combined = hstack(X_list)
+                # Mixed: convert sparse to dense then concatenate
+                X_combined = np.hstack([x.toarray() if hasattr(x, "toarray") else x for x in X_list])
         
         probas = self.clf.predict_proba(X_combined)
         labels_bin = (probas >= threshold).astype(int)
@@ -98,7 +105,8 @@ class Word2VecVectorizer:
         try:
             self.Word2Vec = W2V
         except ImportError:
-            raise ImportError("gensim package is required. Install with: pip install gensim")
+            raise ImportError("gensim package is required here, try installing it with: pip install gensim")
+            # normally this won't happen because it's in the requirements.txt file ;)
         
         self.vector_size = vector_size
         self.window = window
@@ -110,6 +118,7 @@ class Word2VecVectorizer:
         """Train Word2Vec on texts and transform them."""
         # Tokenize texts (simple split, can be improved !!!!!)
         sentences = [text.split() for text in texts]
+        # sentences is a list of lists of words, documentary of w2v name the "sentences" parameter
         
         # Train Word2Vec model sur sentences
         self.model = self.Word2Vec(
@@ -136,7 +145,7 @@ class Word2VecVectorizer:
                 word_vecs = []
                 for word in words:
                     if word in self.model.wv: 
-                        #check if the word exist in the vocabulary already, we skip it if it doesn't ( too rare to be useful )
+                        #check if the word exist in the vocabulary already, we skip it if it doesn't 
                         word_vecs.append(self.model.wv[word])
                 if word_vecs:
                     vectors.append(np.mean(word_vecs, axis=0))
@@ -146,11 +155,41 @@ class Word2VecVectorizer:
                 vectors.append(np.zeros(self.vector_size))
         return np.array(vectors)
 
+def get_codebert_embeddings(texts: List[str], batch_size: int = 32) -> np.ndarray:
+    """Get CodeBERT embeddings for a list of texts. Returns numpy array."""
+    from transformers import AutoTokenizer, AutoModel
+    
+    tokenizer = AutoTokenizer.from_pretrained("microsoft/codebert-base")
+    model = AutoModel.from_pretrained("microsoft/codebert-base")
+    model.eval()  # inference mode, modele deja préentrenné
+    
+    embeddings = []
+    import torch
+    with torch.no_grad():  # on desactive le calcul des gradients (pas besoin lors de l'inference)
+        for i in range(0, len(texts), batch_size):
+            batch_texts = texts[i:i + batch_size]
+            encoded = tokenizer(
+                batch_texts,
+                return_tensors="pt",
+                truncation=True,
+                max_length=512, # tronque si text est plus long, perte d'info ? idk, have to search more
+                padding=True
+            )
+            output = model(**encoded) # debaquetage du dictionnaire encoded en parametres du modele
+            batch_embeddings = output.last_hidden_state[:, 0, :].cpu().numpy() # on prend le token [CLS]
+            embeddings.append(batch_embeddings)
+    
+    return np.vstack(embeddings) # on concatene les embeddings par lignes
 
-def build_pipeline(features: List[str] = None, embedding_type: str = "tfidf", word2vec_vector_size: int = 100, word2vec_min_count: int = 2, word2vec_epochs: int = 10):
+
+def build_components(features: List[str] = None, embedding_desc: str = "tfidf", embedding_code: str = "tfidf", word2vec_params: dict = None):
     """
-    Create embedding vectorizers and classifier.
+    Create embedding vectorizers and classifier components.
+    Each feature can have its own embedding type.
+    Returns vectorizers dict, classifier, and embedding_types dict.
     """
+    if word2vec_params is None:
+        word2vec_params = {"vector_size": 100, "min_count": 2, "epochs": 10}
     
     # Logistic regression with class balancing for imbalanced data
     base_clf = LogisticRegression(
@@ -162,49 +201,63 @@ def build_pipeline(features: List[str] = None, embedding_type: str = "tfidf", wo
     clf = OneVsRestClassifier(base_clf)
     
     vectorizers = {}
+    embedding_types = {}
     
-    if embedding_type == "tfidf":
-        # TF-IDF with unigrams and bigrams
-        tfidf_params = {
-            "ngram_range": (1, 2),
-            "min_df": 2,  # ignore words that appear less than 2 times
-            "max_df": 0.9,
-            "sublinear_tf": True,
-        }
-        
-        if "description" in features:
+    # TF-IDF parameters
+    tfidf_params = {
+        "ngram_range": (1, 2),
+        "min_df": 2,
+        "max_df": 0.9,
+        "sublinear_tf": True,
+    }
+    
+    # Handle description
+    if "description" in features:
+        embedding_types["description"] = embedding_desc
+        if embedding_desc == "tfidf":
             vectorizers["description"] = TfidfVectorizer(**tfidf_params)
-        if "code" in features:
+        elif embedding_desc == "word2vec":
+            vectorizers["description"] = Word2VecVectorizer(**word2vec_params)
+        elif embedding_desc == "codebert":
+            # Codebert, we'll use the function directly
+            vectorizers["description"] = None
+        else:
+            raise ValueError(f"Unknown embedding_desc: {embedding_desc}. Supported: 'tfidf', 'word2vec', 'codebert'")
+    
+    # Handle code
+    if "code" in features:
+        embedding_types["code"] = embedding_code
+        if embedding_code == "tfidf":
             vectorizers["code"] = TfidfVectorizer(**tfidf_params)
+        elif embedding_code == "word2vec":
+            vectorizers["code"] = Word2VecVectorizer(**word2vec_params)
+        elif embedding_code == "codebert":
+            vectorizers["code"] = None
+        else:
+            raise ValueError(f"Unknown embedding_code: {embedding_code}. Supported: 'tfidf', 'word2vec', 'codebert'")
     
-    elif embedding_type == "word2vec":
-        # Word2Vec trained on the dataset
-        if "description" in features:
-            vectorizers["description"] = Word2VecVectorizer(vector_size=word2vec_vector_size, min_count=word2vec_min_count, epochs=word2vec_epochs)
-        if "code" in features:
-            vectorizers["code"] = Word2VecVectorizer(vector_size=word2vec_vector_size, min_count=word2vec_min_count, epochs=word2vec_epochs)
-    
-    else:
-        raise ValueError(f"Unknown embedding_type: {embedding_type}. Supported: 'tfidf', 'word2vec'")
-    
-    return vectorizers, clf
+    return vectorizers, clf, embedding_types
 
 
 def train_model(
     df: pd.DataFrame,
     features: List[str],
-    embedding_type: str = "tfidf",
-    word2vec_vector_size: int = 100,
-    word2vec_min_count: int = 2,
-    word2vec_epochs: int = 10,
-    train_size: float = 0.7,
-    val_size: float = 0.15,
-    random_state: int = 42,
+    embedding_desc: str = "tfidf",
+    embedding_code: str = "tfidf",
+    word2vec_params: dict = None,
+    split_params: dict = None,
 ) -> Tuple[TrainedModel, dict, List[str]]:
     """
     Train the model with train/val/test split.
     Returns validation metrics and test set IDs.
     """
+    if split_params is None:
+        split_params = {"train_size": 0.7, "val_size": 0.15, "random_state": 42}
+    
+    train_size = split_params["train_size"]
+    val_size = split_params["val_size"]
+    random_state = split_params["random_state"]
+    
     # Check that split sizes make sense
     test_size = 1.0 - train_size - val_size
     if test_size <= 0:
@@ -248,40 +301,59 @@ def train_model(
     for idx in idx_test:
         ids_test.append(ids_list[idx])
 
-    # building the pipeline
-    vectorizers, clf = build_pipeline(features=features, embedding_type=embedding_type, word2vec_vector_size=word2vec_vector_size, word2vec_min_count=word2vec_min_count, word2vec_epochs=word2vec_epochs)
+    # vectorizers and classifier
+    vectorizers, clf, embedding_types = build_components(
+        features=features,
+        embedding_desc=embedding_desc,
+        embedding_code=embedding_code,
+        word2vec_params=word2vec_params,
+    )
     
     # Vectorize each feature separately
     X_train_list = []
     X_val_list = []
     
     if "description" in features:
-        X_train_desc = vectorizers["description"].fit_transform(df_train["text_description"].tolist())
-        X_val_desc = vectorizers["description"].transform(df_val["text_description"].tolist())
+        if embedding_types["description"] == "codebert":
+            # Use CodeBERT function directly
+            X_train_desc = get_codebert_embeddings(df_train["text_description"].tolist())
+            X_val_desc = get_codebert_embeddings(df_val["text_description"].tolist())
+        else:
+            # Use vectorizer (TF-IDF or Word2Vec)
+            X_train_desc = vectorizers["description"].fit_transform(df_train["text_description"].tolist())
+            X_val_desc = vectorizers["description"].transform(df_val["text_description"].tolist())
         X_train_list.append(X_train_desc)
         X_val_list.append(X_val_desc)
     
     if "code" in features:
-        X_train_code = vectorizers["code"].fit_transform(df_train["text_code"].tolist())
-        X_val_code = vectorizers["code"].transform(df_val["text_code"].tolist())
+        if embedding_types["code"] == "codebert":
+            X_train_code = get_codebert_embeddings(df_train["text_code"].tolist())
+            X_val_code = get_codebert_embeddings(df_val["text_code"].tolist())
+        else:
+            X_train_code = vectorizers["code"].fit_transform(df_train["text_code"].tolist())
+            X_val_code = vectorizers["code"].transform(df_val["text_code"].tolist())
         X_train_list.append(X_train_code)
         X_val_list.append(X_val_code)
     
-    # Concatenate features (handle both sparse and dense)
+    # Concatenate features: TF-IDF gives sparse matrices, Word2Vec/CodeBERT give dense
     if len(X_train_list) == 1:
         X_train = X_train_list[0]
         X_val = X_val_list[0]
     else:
-        # Toutes les features utilisent le même type d'embedding
-        first = X_train_list[0]
-        if isinstance(first, np.ndarray):
-            # Word2Vec : tout est dense
+        # Check types to use the most efficient concatenation
+        all_sparse = all(hasattr(x, "toarray") for x in X_train_list)
+        all_dense = all(not hasattr(x, "toarray") for x in X_train_list)
+        
+        if all_sparse:
+            X_train = hstack(X_train_list)
+            X_val = hstack(X_val_list)
+        elif all_dense:
             X_train = np.hstack(X_train_list)
             X_val = np.hstack(X_val_list)
         else:
-            # TF-IDF : tout est sparse
-            X_train = hstack(X_train_list)
-            X_val = hstack(X_val_list)
+            # Mixed: convert sparse to dense then concatenate
+            X_train = np.hstack([x.toarray() if hasattr(x, "toarray") else x for x in X_train_list])
+            X_val = np.hstack([x.toarray() if hasattr(x, "toarray") else x for x in X_val_list])
     
     # Train classifier
     clf.fit(X_train, y_train)
@@ -295,31 +367,25 @@ def train_model(
         output_dict=True,
         zero_division=0,
     )
+    
+    # Add multi-label specific metrics
+    # Jaccard similarity: average over samples (each problem gets a score)
+    jaccard_avg = jaccard_score(y_val, y_val_pred, average='samples', zero_division=0)
+    # Hamming loss: fraction of labels that are incorrectly predicted
+    hamming = hamming_loss(y_val, y_val_pred)
+    
+    # Add these to the report
+    val_report['jaccard_similarity'] = jaccard_avg
+    val_report['hamming_loss'] = hamming
 
     model = TrainedModel(
         vectorizers=vectorizers,
         clf=clf,
         features=features,
-        embedding_type=embedding_type,
+        embedding_type=embedding_types,
         mlb=mlb,
         classes_=list(mlb.classes_)
     )
     return model, val_report, ids_test
 
 
-def evaluate_model(
-    model: TrainedModel,
-    texts: Sequence[str],
-    ground_truth: Sequence[Sequence[str]],
-) -> dict:
-    """Evaluate an existing model on a new dataset."""
-    Y_true = model.mlb.transform(ground_truth)
-    Y_pred = model.pipeline.predict(list(texts))
-    report = classification_report(
-        Y_true,
-        Y_pred,
-        target_names=model.classes_,
-        output_dict=True,
-        zero_division=0,
-    )
-    return report

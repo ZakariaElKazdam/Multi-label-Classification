@@ -4,3 +4,4 @@ scikit-learn>=1.0.0
 scipy>=1.7.0
 joblib>=1.0.0
 gensim>=4.0.0
+transformers>=4.20.0
